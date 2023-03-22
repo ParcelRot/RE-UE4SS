@@ -1970,8 +1970,17 @@ Overloads:
 
     auto static process_event_hook([[maybe_unused]]Unreal::UObject* Context, [[maybe_unused]]Unreal::UFunction* Function, [[maybe_unused]]void* Parms) -> void
     {
+        std::vector<Mod::SimpleLuaAction> game_thread_actions_copy{};
+
+        {
+            std::lock_guard<std::mutex> guard{ Mod::m_thread_actions_mutex };
+            // copy all the actions to keep the original vector safe - we will later restore all the uncalled actions
+            game_thread_actions_copy.insert(game_thread_actions_copy.end(), std::make_move_iterator(Mod::m_game_thread_actions.begin()), std::make_move_iterator(Mod::m_game_thread_actions.end()));
+            Mod::m_game_thread_actions.clear();
+        }
+
         // NOTE: This will break horribly if UFunctions ever execute asynchronously.
-        Mod::m_game_thread_actions.erase(std::remove_if(Mod::m_game_thread_actions.begin(), Mod::m_game_thread_actions.end(), [&](Mod::SimpleLuaAction& lua_data) -> bool {
+        game_thread_actions_copy.erase(std::remove_if(game_thread_actions_copy.begin(), game_thread_actions_copy.end(), [&](Mod::SimpleLuaAction& lua_data) -> bool {
             if (Mod::m_is_currently_executing_game_action)
             {
                 // We can only execute one action per frame so we'll have to wait until the next frame.
@@ -1990,7 +1999,12 @@ Overloads:
             set_is_in_game_thread(*lua_data.lua, false);
             Mod::m_is_currently_executing_game_action = false;
             return true;
-        }), Mod::m_game_thread_actions.end());
+        }), game_thread_actions_copy.end());
+
+        {
+            std::lock_guard<std::mutex> guard{ Mod::m_thread_actions_mutex };
+            Mod::m_game_thread_actions.insert(Mod::m_game_thread_actions.end(), std::make_move_iterator(game_thread_actions_copy.begin()), std::make_move_iterator(game_thread_actions_copy.end()));
+        }
     }
 
     auto Mod::setup_lua_global_functions_main_state_only() const -> void
@@ -2062,7 +2076,11 @@ Overloads:
 
             lua_xmove(lua.get_lua_state(), hook_lua->get_lua_state(), 1);
 
-            mod->m_game_thread_actions.emplace_back(SimpleLuaAction{hook_lua, luaL_ref(hook_lua->get_lua_state(), LUA_REGISTRYINDEX)});
+            {
+                std::lock_guard<std::mutex> guard{ Mod::m_thread_actions_mutex };
+                mod->m_game_thread_actions.emplace_back(SimpleLuaAction{ hook_lua, luaL_ref(hook_lua->get_lua_state(), LUA_REGISTRYINDEX) });
+            }
+
             if (!mod->m_is_process_event_hooked)
             {
                 Unreal::Hook::RegisterProcessEventPreCallback(&process_event_hook);
@@ -2651,15 +2669,18 @@ Overloads:
     {
         auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 
+        std::vector<AsyncAction> delayed_actions_copy{};
+
         actions_lock();
 
-        m_delayed_actions.insert(m_delayed_actions.end(), std::make_move_iterator(m_pending_actions.begin()), std::make_move_iterator(m_pending_actions.end()));
+        delayed_actions_copy.insert(delayed_actions_copy.end(), std::make_move_iterator(m_delayed_actions.begin()), std::make_move_iterator(m_delayed_actions.end()));
+        delayed_actions_copy.insert(delayed_actions_copy.end(), std::make_move_iterator(m_pending_actions.begin()), std::make_move_iterator(m_pending_actions.end()));
         m_pending_actions.clear();
-
+        m_delayed_actions.clear();
         actions_unlock();
 
         
-        m_delayed_actions.erase(std::remove_if(m_delayed_actions.begin(), m_delayed_actions.end(),
+        delayed_actions_copy.erase(std::remove_if(delayed_actions_copy.begin(), delayed_actions_copy.end(),
             [&](AsyncAction& action) -> bool {
                 auto passed = now - std::chrono::duration_cast<std::chrono::milliseconds>(action.created_at.time_since_epoch()).count();
                 auto duration_since_creation = (action.type == Mod::ActionType::Immediate || passed >= action.delay);
@@ -2691,7 +2712,11 @@ Overloads:
                 {
                     return false;
                 }
-            }), m_delayed_actions.end());
+            }), delayed_actions_copy.end());
+
+        actions_lock();
+        m_delayed_actions.insert(m_delayed_actions.end(), std::make_move_iterator(delayed_actions_copy.begin()), std::make_move_iterator(delayed_actions_copy.end()));
+        actions_unlock();
     }
 
     auto Mod::clear_delayed_actions() -> void
