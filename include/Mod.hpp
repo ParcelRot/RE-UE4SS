@@ -97,7 +97,7 @@ namespace RC
         static inline std::vector<LuaCallbackData> m_begin_play_pre_callbacks{};
         static inline std::vector<LuaCallbackData> m_begin_play_post_callbacks{};
         static inline bool m_is_currently_executing_game_action{};
-        static inline std::recursive_mutex m_thread_actions_mutex{};
+        static inline std::mutex m_thread_actions_mutex{};
 
     protected:
         std::jthread m_async_thread;
